@@ -18,7 +18,7 @@ banner() {
   echo -e "  ██╔══██╗██║   ██║██║     ██╔═██╗ "
   echo -e "  ██████╔╝╚██████╔╝███████╗██║  ██╗"
   echo -e "  ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝${NC}"
-  echo -e "  ${DIM}  BULK IMAGE TOOL   ·   convert & compress${NC}"
+  echo -e "  ${DIM} IMAGE TOOL · convert & compress${NC}"
   echo -e ""
 }
 
@@ -427,13 +427,16 @@ EOF
 # ══════════════════════════════════════════════
 #  MAIN MENU
 # ══════════════════════════════════════════════
+clear
 banner
 check_deps
 
-echo -e "${W}> Select bulk job:${NC}"
-echo -e "  ${C}1.${NC} ${BOLD}Bulk Convert${NC}   ${DIM}— Convert images to a different format${NC}"
-echo -e "  ${C}2.${NC} ${BOLD}Bulk Compress${NC}  ${DIM}— Reduce file size, keep same format${NC}"
-printf "  \$ "
+echo -e "${W}>  Select bulk job:${NC}"
+echo ""
+echo -e "  ${C}1.${NC} ${BOLD}Bulk Convert${NC}  ${DIM}Convert images to a different format${NC}"
+echo -e "  ${C}2.${NC} ${BOLD}Bulk Compress${NC}  ${DIM}Reduce file size, keep same format${NC}"
+echo ""
+printf "   \$ "
 read -r JOB
 
 case "$JOB" in
