@@ -1,3 +1,3 @@
 # BULK
-## CLI bulk image tool for the linux terminal
-<img width="923" height="715" alt="Image" src="https://github.com/user-attachments/assets/4ff1d263-c1e0-4341-ab86-6c34f1aab124" />
+## CLI bulk image & Video tool for the linux terminal
+<img width="619" height="846" alt="bulk" src="https://github.com/user-attachments/assets/c4bb6f98-2a30-4851-a3cd-7c1ab779322c" />
