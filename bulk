@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────
-#  bulk — Bulk image tool
-#  Jobs: Convert, Compress
-#  Deps: imagemagick (convert), optipng
+#  bulk — Bulk image & video tool
+#  Jobs: Convert, Compress, Video Compress
+#  Deps: imagemagick (convert), optipng, ffmpeg (video)
 # ─────────────────────────────────────────────
 
 R='\033[0;31m'  G='\033[0;32m'  Y='\033[1;33m'
@@ -18,7 +18,7 @@ banner() {
   echo -e "  ██╔══██╗██║   ██║██║     ██╔═██╗ "
   echo -e "  ██████╔╝╚██████╔╝███████╗██║  ██╗"
   echo -e "  ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝${NC}"
-  echo -e "  ${DIM} IMAGE TOOL · convert & compress${NC}"
+  echo -e "  ${DIM} BULK TOOL · images & video${NC}"
   echo -e ""
 }
 
@@ -27,6 +27,7 @@ check_deps() {
   local missing=()
   command -v convert &>/dev/null || missing+=("imagemagick")
   command -v optipng &>/dev/null || missing+=("optipng")
+  command -v ffmpeg  &>/dev/null || missing+=("ffmpeg")
   if [ ${#missing[@]} -gt 0 ]; then
     echo -e "${Y}⚠  Missing: ${missing[*]}${NC}"
     echo -e "${DIM}   sudo apt install ${missing[*]}${NC}\n"
@@ -425,22 +426,471 @@ EOF
 }
 
 # ══════════════════════════════════════════════
+#  JOB 3 — BULK VIDEO COMPRESS
+#  Background worker + live monitor TUI
+#  Supports 1 level of nested subdirectories
+# ══════════════════════════════════════════════
+BULK_PROGRESS_DIR="/tmp/bulk-video"
+BULK_PROGRESS_FILE="${BULK_PROGRESS_DIR}/progress"
+BULK_WORKER_PID_FILE="${BULK_PROGRESS_DIR}/worker.pid"
+BULK_LOG_FILE="${BULK_PROGRESS_DIR}/worker.log"
+
+# ── Monitor TUI ──────────────────────────────
+_video_monitor() {
+  # Trap Ctrl+C to exit monitor cleanly (worker keeps running)
+  trap 'printf "\033[?25h\n"; echo -e "\n  ${DIM}Monitor detached. Worker PID $(cat "$BULK_WORKER_PID_FILE" 2>/dev/null) still running.${NC}"; echo -e "  ${DIM}Re-attach:  ${NC}${BOLD}bulk -m${NC}\n"; exit 0' INT
+
+  printf "\033[?25l"  # hide cursor
+
+  while true; do
+    if [ ! -f "$BULK_PROGRESS_FILE" ]; then
+      printf "\r  ${DIM}Waiting for worker to start…${NC}"
+      sleep 0.5
+      continue
+    fi
+
+    # Read progress state
+    local state cur_file file_pct files_done files_total total_saved status
+    # shellcheck disable=SC1090
+    source "$BULK_PROGRESS_FILE" 2>/dev/null
+
+    # Check if worker is still alive
+    local worker_pid
+    worker_pid=$(cat "$BULK_WORKER_PID_FILE" 2>/dev/null)
+    local worker_alive=0
+    if [ -n "$worker_pid" ] && kill -0 "$worker_pid" 2>/dev/null; then
+      worker_alive=1
+    fi
+
+    # Calculate bulk progress bar
+    local bar_width=40 filled empty bulk_pct bar=""
+    if (( files_total > 0 )); then
+      bulk_pct=$(( files_done * 100 / files_total ))
+      filled=$(( files_done * bar_width / files_total ))
+    else
+      bulk_pct=0
+      filled=0
+    fi
+    empty=$(( bar_width - filled ))
+    for (( i=0; i<filled; i++ )); do bar+="▓"; done
+    for (( i=0; i<empty;  i++ )); do bar+=" "; done
+
+    # Status icon for current file
+    local icon="⠿"
+    if [ "$status" = "done" ]; then
+      icon="✓"
+    elif [ "$status" = "fail" ]; then
+      icon="✗"
+    fi
+
+    # Truncate filename to fit
+    local display_name="$cur_file"
+    if (( ${#display_name} > 40 )); then
+      display_name="…${display_name: -39}"
+    fi
+
+    # Saved so far
+    local saved_hr=""
+    if (( total_saved > 0 )); then
+      saved_hr=$(human_size "$total_saved")
+    fi
+
+    # Render — move up 4 lines, redraw
+    printf "\033[4A\033[J" 2>/dev/null || printf "\033[J"
+    echo ""
+    if [ "$status" = "complete" ]; then
+      echo -e "  ${G}${BOLD}✓ COMPLETE${NC}  ${DIM}All ${files_total} files processed${NC}"
+      if [ -n "$saved_hr" ]; then
+        echo -e "  ${DIM}Saved: ${NC}${BOLD}${saved_hr}${NC}"
+      fi
+      echo -e "  ${DIM}Output: ${NC}${out_dir}"
+      printf "\033[?25h"  # show cursor
+      # Show failed files if any
+      if [ -f "${BULK_PROGRESS_DIR}/failed.list" ]; then
+        local fail_count
+        fail_count=$(wc -l < "${BULK_PROGRESS_DIR}/failed.list")
+        if (( fail_count > 0 )); then
+          echo ""
+          echo -e "  ${R}Failed files (${fail_count}):${NC}"
+          while IFS= read -r ff; do
+            echo -e "  ${DIM}  · $ff${NC}"
+          done < "${BULK_PROGRESS_DIR}/failed.list"
+        fi
+      fi
+      echo ""
+      return 0
+    fi
+
+    printf "  compressing ${W}%-40s${NC} - ${BOLD}%3d%%${NC} Complete  - ${BOLD}%d${NC} of ${BOLD}%d${NC} files  [${G}%s${NC}]\n" \
+      "$display_name" "${file_pct:-0}" "${files_done:-0}" "${files_total:-0}" "$icon"
+    echo ""
+    printf "  BULK JOB:  [ ${G}%s${NC} ]  ${BOLD}%3d%%${NC}" "$bar" "$bulk_pct"
+    if [ -n "$saved_hr" ]; then
+      printf "   ${DIM}saved: %s${NC}" "$saved_hr"
+    fi
+    echo ""
+
+    if [ "$worker_alive" -eq 0 ] && [ "$status" != "complete" ]; then
+      echo ""
+      echo -e "  ${Y}⚠  Worker process exited unexpectedly. Check: ${NC}${DIM}${BULK_LOG_FILE}${NC}"
+      printf "\033[?25h"
+      return 1
+    fi
+
+    sleep 0.3
+  done
+}
+
+# ── Background worker ────────────────────────
+_video_worker() {
+  local vid_dir="$1" out_base="$2" crf="$3" vcodec="$4" audio_args="$5"
+  local BULK_PROGRESS_DIR="$6" BULK_PROGRESS_FILE="$7" BULK_WORKER_PID_FILE="$8"
+
+  # Write PID
+  echo $$ > "$BULK_WORKER_PID_FILE"
+
+  # Clear failed list
+  : > "${BULK_PROGRESS_DIR}/failed.list"
+
+  # Gather videos (maxdepth 2 = parent + 1 level of subdirs)
+  local -a vid_files
+  mapfile -t vid_files < <(find "$vid_dir" -maxdepth 2 -type f \
+    \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \
+       -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" \
+       -o -iname "*.webm" -o -iname "*.m4v" -o -iname "*.ts" \
+       -o -iname "*.mpg" -o -iname "*.mpeg" \) \
+    ! -path "${out_base}/*" \
+    | sort)
+
+  local total=${#vid_files[@]}
+  local done_count=0 saved_total=0
+
+  # Initial progress
+  cat > "$BULK_PROGRESS_FILE" <<PEOF
+cur_file="starting…"
+file_pct=0
+files_done=0
+files_total=${total}
+total_saved=0
+out_dir="${out_base}"
+status="working"
+PEOF
+
+  for vf in "${vid_files[@]}"; do
+    local rel_path fname dest_dir dest src_size
+    rel_path="${vf#$vid_dir/}"
+    fname=$(basename "$vf")
+    dest_dir="${out_base}/$(dirname "$rel_path")"
+    dest="${dest_dir}/${fname}"
+
+    mkdir -p "$dest_dir"
+    src_size=$(stat -c%s "$vf" 2>/dev/null || echo 0)
+
+    # Update progress: starting this file
+    cat > "$BULK_PROGRESS_FILE" <<PEOF
+cur_file="${rel_path}"
+file_pct=0
+files_done=${done_count}
+files_total=${total}
+total_saved=${saved_total}
+out_dir="${out_base}"
+status="working"
+PEOF
+
+    # Get video duration for per-file progress
+    local duration_s
+    duration_s=$(ffprobe -v quiet -show_entries format=duration \
+      -of default=noprint_wrappers=1:nokey=1 "$vf" 2>/dev/null | cut -d. -f1)
+    duration_s=${duration_s:-0}
+
+    # Run ffmpeg, parse progress from stderr
+    ffmpeg -y -nostdin -i "$vf" \
+      -c:v "$vcodec" -crf "$crf" -preset medium \
+      $audio_args \
+      -movflags +faststart \
+      -progress pipe:1 \
+      "$dest" </dev/null 2>>"$BULK_LOG_FILE" | \
+    while IFS='=' read -r key val; do
+      if [ "$key" = "out_time_us" ] && (( duration_s > 0 )); then
+        local elapsed_s=$(( val / 1000000 ))
+        local pct=$(( elapsed_s * 100 / duration_s ))
+        (( pct > 100 )) && pct=100
+        cat > "$BULK_PROGRESS_FILE" <<PEOF2
+cur_file="${rel_path}"
+file_pct=${pct}
+files_done=${done_count}
+files_total=${total}
+total_saved=${saved_total}
+out_dir="${out_base}"
+status="working"
+PEOF2
+      fi
+    done
+
+    if [ -f "$dest" ] && [ -s "$dest" ]; then
+      local dst_size
+      dst_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+      # If compressed is larger, keep original
+      if (( dst_size >= src_size )); then
+        cp "$vf" "$dest" 2>/dev/null
+        dst_size=$src_size
+      fi
+      local delta=$(( src_size - dst_size ))
+      (( delta > 0 )) && saved_total=$(( saved_total + delta ))
+      (( done_count++ ))
+
+      cat > "$BULK_PROGRESS_FILE" <<PEOF
+cur_file="${rel_path}"
+file_pct=100
+files_done=${done_count}
+files_total=${total}
+total_saved=${saved_total}
+out_dir="${out_base}"
+status="done"
+PEOF
+    else
+      (( done_count++ ))
+      echo "$rel_path" >> "${BULK_PROGRESS_DIR}/failed.list"
+      cat > "$BULK_PROGRESS_FILE" <<PEOF
+cur_file="${rel_path}"
+file_pct=0
+files_done=${done_count}
+files_total=${total}
+total_saved=${saved_total}
+out_dir="${out_base}"
+status="fail"
+PEOF
+    fi
+  done
+
+  # Final complete status
+  cat > "$BULK_PROGRESS_FILE" <<PEOF
+cur_file=""
+file_pct=100
+files_done=${done_count}
+files_total=${total}
+total_saved=${saved_total}
+out_dir="${out_base}"
+status="complete"
+PEOF
+}
+
+# ── Job entry point (interactive prompts) ─────
+job_video_compress() {
+  if ! command -v ffmpeg &>/dev/null; then
+    echo -e "\n${R}✗  ffmpeg is required for video compression.${NC}"
+    echo -e "${DIM}   sudo apt install ffmpeg${NC}\n"
+    exit 1
+  fi
+
+  # Check if a job is already running
+  if [ -f "$BULK_WORKER_PID_FILE" ]; then
+    local existing_pid
+    existing_pid=$(cat "$BULK_WORKER_PID_FILE" 2>/dev/null)
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      echo -e "\n${Y}⚠  A video compress job is already running (PID ${existing_pid}).${NC}"
+      echo -e "  ${DIM}Use ${NC}${BOLD}bulk -m${NC}${DIM} to monitor it.${NC}\n"
+      exit 1
+    fi
+  fi
+
+  echo ""
+  echo -e "${W}> Enter path to parent video folder${NC}"
+  echo -e "  ${DIM}All videos in this folder + 1 level of subdirectories will be compressed${NC}"
+  printf "  \$ "
+  read -r VID_DIR
+  VID_DIR="${VID_DIR%/}"
+  VID_DIR="${VID_DIR/#\~/$HOME}"
+  if [ ! -d "$VID_DIR" ]; then
+    echo -e "${R}✗  Directory not found: $VID_DIR${NC}"; exit 1
+  fi
+
+  local DIR_NAME
+  DIR_NAME=$(basename "$VID_DIR")
+  local OUT_BASE="${VID_DIR}/${DIR_NAME}_Compressed"
+
+  # Quick scan to show what was found
+  mapfile -t _PREVIEW < <(find "$VID_DIR" -maxdepth 2 -type f \
+    \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \
+       -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" \
+       -o -iname "*.webm" -o -iname "*.m4v" -o -iname "*.ts" \
+       -o -iname "*.mpg" -o -iname "*.mpeg" \) \
+    ! -path "${OUT_BASE}/*" \
+    | sort)
+
+  local VID_TOTAL=${#_PREVIEW[@]}
+  if [ "$VID_TOTAL" -eq 0 ]; then
+    echo -e "${Y}⚠  No video files found in ${VID_DIR}${NC}"; exit 0
+  fi
+
+  echo ""
+  echo -e "${W}> Found ${BOLD}${VID_TOTAL}${NC}${W} video(s):${NC}"
+  for f in "${_PREVIEW[@]}"; do
+    echo -e "  ${DIM}· ${f#$VID_DIR/}${NC}"
+  done
+
+  # Compression preset
+  echo ""
+  echo -e "${W}> Choose compression preset:${NC}"
+  echo -e "  ${C}1.${NC} ${BOLD}balanced${NC}     ${DIM}— CRF 23, good quality/size ratio (default)${NC}"
+  echo -e "  ${C}2.${NC} ${BOLD}aggressive${NC}   ${DIM}— CRF 28, smaller files, some quality loss${NC}"
+  echo -e "  ${C}3.${NC} ${BOLD}light${NC}        ${DIM}— CRF 18, near-lossless, moderate savings${NC}"
+  echo -e "  ${C}4.${NC} ${BOLD}custom${NC}       ${DIM}— Enter your own CRF value (0-51)${NC}"
+  printf "  \$ "
+  read -r VID_PRESET
+  local CRF
+  case "$VID_PRESET" in
+    1|"") CRF=23 ;;
+    2)    CRF=28 ;;
+    3)    CRF=18 ;;
+    4)
+      echo -e "${W}> Enter CRF value ${DIM}[0=lossless, 23=default, 51=worst]:${NC}"
+      printf "  \$ "
+      read -r CRF_INPUT
+      if [[ "$CRF_INPUT" =~ ^[0-9]+$ ]] && (( CRF_INPUT >= 0 && CRF_INPUT <= 51 )); then
+        CRF=$CRF_INPUT
+      else
+        echo -e "${R}✗  Invalid CRF value.${NC}"; exit 1
+      fi
+      ;;
+    *) echo -e "${R}✗  Invalid choice.${NC}"; exit 1 ;;
+  esac
+
+  # Codec selection
+  echo ""
+  echo -e "${W}> Choose codec:${NC}"
+  echo -e "  ${C}1.${NC} ${BOLD}H.264${NC}  ${DIM}— Universal compatibility (default)${NC}"
+  echo -e "  ${C}2.${NC} ${BOLD}H.265${NC}  ${DIM}— ~50% smaller, slower encode, good device support${NC}"
+  printf "  \$ "
+  read -r CODEC_CHOICE
+  local VCODEC
+  case "$CODEC_CHOICE" in
+    1|"") VCODEC="libx264" ;;
+    2)    VCODEC="libx265" ;;
+    *)    echo -e "${R}✗  Invalid choice.${NC}"; exit 1 ;;
+  esac
+
+  # Audio handling
+  echo ""
+  echo -e "${W}> Audio handling:${NC}"
+  echo -e "  ${C}1.${NC} ${BOLD}copy${NC}      ${DIM}— Keep original audio untouched (default)${NC}"
+  echo -e "  ${C}2.${NC} ${BOLD}compress${NC}   ${DIM}— Re-encode audio to AAC 128k${NC}"
+  echo -e "  ${C}3.${NC} ${BOLD}strip${NC}      ${DIM}— Remove audio entirely${NC}"
+  printf "  \$ "
+  read -r AUDIO_CHOICE
+  local AUDIO_ARGS
+  case "$AUDIO_CHOICE" in
+    1|"") AUDIO_ARGS="-c:a copy" ;;
+    2)    AUDIO_ARGS="-c:a aac -b:a 128k" ;;
+    3)    AUDIO_ARGS="-an" ;;
+    *)    echo -e "${R}✗  Invalid choice.${NC}"; exit 1 ;;
+  esac
+
+  mkdir -p "$OUT_BASE"
+  mkdir -p "$BULK_PROGRESS_DIR"
+  : > "$BULK_LOG_FILE"
+
+  echo ""
+  echo -e "  ${DIM}Codec:   ${NC}${BOLD}${VCODEC}${NC} ${DIM}(CRF ${CRF})${NC}"
+  echo -e "  ${DIM}Source:  ${NC}${VID_DIR}"
+  echo -e "  ${DIM}Output:  ${NC}${OUT_BASE}"
+  echo ""
+  echo -e "${W}> Launching background worker for ${BOLD}${VID_TOTAL}${NC}${W} video(s)…${NC}"
+  echo -e "  ${DIM}Ctrl+C to detach monitor (worker keeps running)${NC}"
+  echo -e "  ${DIM}Re-attach:  ${NC}${BOLD}bulk -m${NC}"
+  echo ""
+
+  # Write worker as standalone script (avoids quote-mangling from declare -f)
+  local WORKER_SCRIPT="${BULK_PROGRESS_DIR}/worker.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "VID_DIR=\"$VID_DIR\""
+    echo "OUT_BASE=\"$OUT_BASE\""
+    echo "CRF=\"$CRF\""
+    echo "VCODEC=\"$VCODEC\""
+    echo "AUDIO_ARGS=\"$AUDIO_ARGS\""
+    echo "BULK_PROGRESS_DIR=\"$BULK_PROGRESS_DIR\""
+    echo "BULK_PROGRESS_FILE=\"$BULK_PROGRESS_FILE\""
+    echo "BULK_WORKER_PID_FILE=\"$BULK_WORKER_PID_FILE\""
+    echo "BULK_LOG_FILE=\"$BULK_LOG_FILE\""
+    # Embed worker function via type extraction (safe — reads from this script)
+    declare -f _video_worker
+    declare -f human_size
+    echo '_video_worker "$VID_DIR" "$OUT_BASE" "$CRF" "$VCODEC" "$AUDIO_ARGS" "$BULK_PROGRESS_DIR" "$BULK_PROGRESS_FILE" "$BULK_WORKER_PID_FILE"'
+  } > "$WORKER_SCRIPT"
+  chmod +x "$WORKER_SCRIPT"
+
+  # Launch worker fully detached (own process group, immune to SIGINT/SIGHUP)
+  setsid "$WORKER_SCRIPT" </dev/null >>"$BULK_LOG_FILE" 2>&1 &
+  # Give it a moment to start and write PID file
+  sleep 0.8
+  local WORKER_PID=""
+  if [ -f "$BULK_WORKER_PID_FILE" ]; then
+    WORKER_PID=$(cat "$BULK_WORKER_PID_FILE")
+  fi
+
+  # Print blank lines for monitor to overwrite
+  echo ""; echo ""; echo ""; echo ""
+  _video_monitor
+}
+
+# ══════════════════════════════════════════════
 #  MAIN MENU
 # ══════════════════════════════════════════════
+
+# Handle -m flag: re-attach to running video monitor
+if [ "${1:-}" = "-m" ]; then
+  R='\033[0;31m'  G='\033[0;32m'  Y='\033[1;33m'
+  C='\033[0;36m'  W='\033[1;37m'
+  DIM='\033[2m'   BOLD='\033[1m'  NC='\033[0m'
+
+  if [ ! -f "$BULK_WORKER_PID_FILE" ]; then
+    echo -e "\n  ${Y}⚠  No active video compress job found.${NC}\n"
+    exit 1
+  fi
+
+  local_pid=$(cat "$BULK_WORKER_PID_FILE" 2>/dev/null)
+  if [ -z "$local_pid" ]; then
+    echo -e "\n  ${Y}⚠  No active video compress job found.${NC}\n"
+    exit 1
+  fi
+
+  if ! kill -0 "$local_pid" 2>/dev/null; then
+    # Worker finished — check if progress file shows complete
+    if [ -f "$BULK_PROGRESS_FILE" ] && grep -q 'status="complete"' "$BULK_PROGRESS_FILE" 2>/dev/null; then
+      echo ""
+      echo ""; echo ""; echo ""; echo ""
+      _video_monitor
+      exit 0
+    fi
+    echo -e "\n  ${Y}⚠  Worker (PID ${local_pid}) is no longer running.${NC}"
+    echo -e "  ${DIM}Check log: ${BULK_LOG_FILE}${NC}\n"
+    exit 1
+  fi
+
+  echo -e "\n  ${G}● Attached to video compress job${NC} ${DIM}(PID ${local_pid})${NC}"
+  echo -e "  ${DIM}Ctrl+C to detach${NC}"
+  echo ""; echo ""; echo ""; echo ""
+  _video_monitor
+  exit $?
+fi
+
 clear
 banner
 check_deps
 
 echo -e "${W}>  Select bulk job:${NC}"
 echo ""
-echo -e "  ${C}1.${NC} ${BOLD}Bulk Convert${NC}  ${DIM}Convert images to a different format${NC}"
-echo -e "  ${C}2.${NC} ${BOLD}Bulk Compress${NC}  ${DIM}Reduce file size, keep same format${NC}"
+echo -e "  ${C}1.${NC} ${BOLD}Bulk Convert${NC}         ${DIM}Convert images to a different format${NC}"
+echo -e "  ${C}2.${NC} ${BOLD}Bulk Compress${NC}        ${DIM}Reduce image file size, keep same format${NC}"
+echo -e "  ${C}3.${NC} ${BOLD}Bulk Video Compress${NC}  ${DIM}Compress videos with ffmpeg (+ subdirs)${NC}"
 echo ""
 printf "   \$ "
 read -r JOB
 
 case "$JOB" in
-  1) job_convert  ;;
-  2) job_compress ;;
-  *) echo -e "${R}✗  Invalid choice. Enter 1 or 2.${NC}"; exit 1 ;;
+  1) job_convert        ;;
+  2) job_compress       ;;
+  3) job_video_compress ;;
+  *) echo -e "${R}✗  Invalid choice. Enter 1, 2, or 3.${NC}"; exit 1 ;;
 esac
